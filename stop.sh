@@ -102,9 +102,13 @@ clipboard_read() {
 
 clipboard_write() {
   case "$PLATFORM" in
-    macos)   echo -n "$1" | pbcopy ;;
-    x11)     echo -n "$1" | xclip -selection clipboard ;;
-    wayland) echo -n "$1" | wl-copy ;;
+    macos)   printf '%s' "$1" | pbcopy ;;
+    x11)     printf '%s' "$1" | xclip -selection clipboard ;;
+    wayland) printf '%s' "$1" | wl-copy ;;
+    *)
+      log_error "clipboard_write: unrecognised platform '$PLATFORM'"
+      return 1
+      ;;
   esac
 }
 
@@ -189,10 +193,12 @@ run_llm() {
 
   case "$llm_backend" in
     ollama)
-      output=$(echo "$input" | timeout 10 ollama run "$llm_model_path" 2>/dev/null) || llm_exit=$?
+      output=$(printf '%s' "$input" | timeout 10 ollama run "$llm_model_path" \
+        --system "$llm_system_prompt" 2>/dev/null) || llm_exit=$?
       ;;
     llama.cpp)
-      output=$(echo "$input" | timeout 10 llama-cli -m "$llm_model_path" --prompt "$llm_system_prompt" --stdin 2>/dev/null) || llm_exit=$?
+      output=$(printf '%s' "$input" | timeout 10 llama-cli -m "$llm_model_path" \
+        --prompt "$llm_system_prompt" --stdin 2>/dev/null) || llm_exit=$?
       ;;
     transformers)
       output=$(echo "$input" | timeout 10 \

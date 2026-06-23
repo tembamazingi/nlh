@@ -471,8 +471,7 @@ nlh_clear() {
 nlh_config() {
   if [[ ! -f "$NLH_CONFIG" ]]; then
     echo "nlh: no config found. Run 'nlh setup' first." >&2
-    "${EDITOR:-vi}" "$NLH_CONFIG"
-    return
+    exit 1
   fi
   "${EDITOR:-vi}" "$NLH_CONFIG"
 }
