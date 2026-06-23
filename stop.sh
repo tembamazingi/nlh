@@ -9,7 +9,8 @@
 #   NLH_ERROR_LOG    — error.log path
 #   NLH_CAP_FILE     — path to WAV capture file
 #   NLH_PLATFORM     — macos|x11|wayland (auto-detected if unset)
-#   NLH_MAX_DURATION_HIT — set to 1 if max duration was reached
+#   NLH_MAX_DURATION_FLAG — path to flag file written by start.sh on timeout
+#   NLH_MAX_DURATION_HIT — set to 1 if max duration was reached (legacy/test override)
 #   NLH_TEST_CLIPBOARD_RESTORE_FAIL — set to 1 to test clipboard.bak path
 
 set -uo pipefail
@@ -20,8 +21,15 @@ NLH_CONFIG="${NLH_CONFIG:-$NLH_HOME/config}"
 NLH_LOG="${NLH_LOG:-$NLH_HOME/captures.log}"
 NLH_ERROR_LOG="${NLH_ERROR_LOG:-$NLH_HOME/error.log}"
 NLH_CAP_FILE="${NLH_CAP_FILE:-${TMPDIR:-/tmp}/nlh_cap.wav}"
+NLH_MAX_DURATION_FLAG="${NLH_MAX_DURATION_FLAG:-${TMPDIR:-/tmp}/nlh_max_duration}"
 NLH_MAX_DURATION_HIT="${NLH_MAX_DURATION_HIT:-0}"
 NLH_TEST_CLIPBOARD_RESTORE_FAIL="${NLH_TEST_CLIPBOARD_RESTORE_FAIL:-0}"
+
+# Check flag file written by start.sh (env vars don't cross skhd process boundaries)
+if [[ -f "$NLH_MAX_DURATION_FLAG" ]]; then
+  NLH_MAX_DURATION_HIT=1
+  rm -f "$NLH_MAX_DURATION_FLAG"
+fi
 
 # shellcheck disable=SC2034
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -149,7 +157,7 @@ fi
 start_time=$(date +%s)
 
 whisper_output=""
-if ! whisper_output=$(whisper-cli --model "$whisper_model_path" --output-txt --no-gpu -f "$NLH_CAP_FILE" 2>/dev/null); then
+if ! whisper_output=$(whisper-cli --model "$whisper_model_path" --no-gpu -f "$NLH_CAP_FILE" 2>/dev/null); then
   log_error "whisper-cli failed (non-zero exit) for capture $NLH_CAP_FILE"
   exit 1
 fi
@@ -183,7 +191,10 @@ run_llm() {
       output=$(echo "$input" | timeout 10 llama-cli -m "$llm_model_path" --prompt "$llm_system_prompt" --stdin 2>/dev/null) || llm_exit=$?
       ;;
     transformers)
-      output=$(echo "$input" | timeout 10 python3 "$llm_script_path" 2>/dev/null) || llm_exit=$?
+      output=$(echo "$input" | timeout 10 \
+        NLH_LLM_MODEL_PATH="$llm_model_path" \
+        NLH_LLM_SYSTEM_PROMPT="$llm_system_prompt" \
+        python3 "$llm_script_path" 2>/dev/null) || llm_exit=$?
       ;;
     *)
       llm_exit=1
