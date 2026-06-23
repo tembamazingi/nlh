@@ -171,9 +171,14 @@ nlh_start() {
     else
       echo "nlh: skhd not found. Install via: brew install skhd" >&2
     fi
-    # Start ollama if configured
+    # Register ollama as a login service if configured
     if [[ "${llm_backend:-}" == "ollama" ]] && command -v ollama &>/dev/null; then
-      ollama serve &>/dev/null &
+      if command -v brew &>/dev/null; then
+        brew services start ollama &>/dev/null && echo "nlh: ollama service started" || true
+      else
+        ollama serve &>/dev/null &
+        echo "nlh: ollama started (brew not found; running in background)"
+      fi
     fi
   else
     if command -v sxhkd &>/dev/null; then
@@ -193,6 +198,10 @@ nlh_stop() {
     if command -v skhd &>/dev/null; then
       skhd --stop-service 2>/dev/null || true
       echo "nlh: skhd stopped"
+    fi
+    # Stop ollama service if it was registered
+    if command -v brew &>/dev/null && brew services list 2>/dev/null | grep -q "^ollama"; then
+      brew services stop ollama &>/dev/null && echo "nlh: ollama service stopped" || true
     fi
     pkill -f "sox -d" 2>/dev/null || true
   else
