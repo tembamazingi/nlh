@@ -93,6 +93,10 @@ clipboard_read() {
     macos)   pbpaste ;;
     x11)     xclip -selection clipboard -o ;;
     wayland) wl-paste ;;
+    *)
+      log_error "clipboard_read: unrecognised platform '$PLATFORM'"
+      return 1
+      ;;
   esac
 }
 

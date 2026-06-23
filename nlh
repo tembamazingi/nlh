@@ -74,7 +74,7 @@ hotkey=rcmd + ralt
 llm_backend=ollama
 llm_model_path=llama3
 llm_script_path=$SCRIPT_DIR/scripts/llm_refine.py
-llm_system_prompt="You are a transcript cleaner. Remove filler words (um, uh, like, you know), false starts, and self-corrections. Fix punctuation and capitalisation. Preserve all technical terms, proper nouns, and code identifiers exactly as spoken. Output only the cleaned transcript — no commentary, no explanations."
+llm_system_prompt=You are a transcript cleaner. Remove filler words (um, uh, like, you know), false starts, and self-corrections. Fix punctuation and capitalisation. Preserve all technical terms, proper nouns, and code identifiers exactly as spoken. Output only the cleaned transcript — no commentary, no explanations.
 log_path=$NLH_HOME/captures.log
 max_duration=300
 EOF
@@ -120,7 +120,7 @@ hotkey=$_hotkey
 llm_backend=$_llm_backend
 llm_model_path=$_llm_model
 llm_script_path=$SCRIPT_DIR/scripts/llm_refine.py
-llm_system_prompt="You are a transcript cleaner. Remove filler words (um, uh, like, you know), false starts, and self-corrections. Fix punctuation and capitalisation. Preserve all technical terms, proper nouns, and code identifiers exactly as spoken. Output only the cleaned transcript — no commentary, no explanations."
+llm_system_prompt=You are a transcript cleaner. Remove filler words (um, uh, like, you know), false starts, and self-corrections. Fix punctuation and capitalisation. Preserve all technical terms, proper nouns, and code identifiers exactly as spoken. Output only the cleaned transcript — no commentary, no explanations.
 log_path=$NLH_HOME/captures.log
 max_duration=$_max_dur
 EOF
@@ -311,9 +311,12 @@ nlh_open() {
 
   # Build sorted list (newest first) — bash 3.2 compatible
   local capture_files=()
-  while IFS= read -r _f; do
-    capture_files+=("$_f")
-  done < <(ls -t "$captures_dir/"*.md 2>/dev/null || true)
+  if [[ -d "$captures_dir" ]]; then
+    while IFS= read -r _f; do
+      capture_files+=("$_f")
+    done < <(find "$captures_dir" -maxdepth 1 -name '*.md' -print0 \
+               | xargs -0 ls -t 2>/dev/null || true)
+  fi
 
   if [[ -z "$entry_num" ]]; then
     # No entry number: try fzf, or error
