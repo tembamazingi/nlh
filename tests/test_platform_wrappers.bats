@@ -1,5 +1,6 @@
 #!/usr/bin/env bats
 # Tests for nlh-paste and nlh-type platform wrapper selection (F5)
+bats_require_minimum_version 1.5.0
 
 load 'helpers/mocks'
 
@@ -73,35 +74,34 @@ setup() {
 
 @test "nlh-paste auto-detects macOS when pbcopy is available and DISPLAY unset" {
   create_macos_paste_mocks
-  # Ensure no X11/Wayland markers
-  run bash -c "
+  run -0 bash -c "
     unset DISPLAY
     unset WAYLAND_DISPLAY
     unset NLH_PLATFORM
-    PATH='$BATS_TEST_TMPDIR/bin' echo 'auto detect' | '$NLH_PASTE_SCRIPT'
+    PATH='$BATS_TEST_TMPDIR/bin:$PATH' echo 'auto detect' | '$NLH_PASTE_SCRIPT'
   "
-  # Should succeed by using pbcopy (which our mock supports)
-  [ "$status" -eq 0 ] || true  # platform detection may vary; just ensure no crash
 }
 
 @test "nlh-type auto-detects macOS when osascript available and DISPLAY unset" {
   create_macos_paste_mocks
-  run bash -c "
+  run -0 bash -c "
     unset DISPLAY
     unset WAYLAND_DISPLAY
     unset NLH_PLATFORM
-    PATH='$BATS_TEST_TMPDIR/bin' '$NLH_TYPE_SCRIPT'
+    PATH='$BATS_TEST_TMPDIR/bin:$PATH' '$NLH_TYPE_SCRIPT'
   "
-  [ "$status" -eq 0 ] || true
 }
 
 @test "nlh-paste exits non-zero when platform undetectable and no tool available" {
-  run bash -c "
+  local empty_bin="$BATS_TEST_TMPDIR/empty-bin"
+  mkdir -p "$empty_bin"
+  run -1 bash -c "
     unset DISPLAY
     unset WAYLAND_DISPLAY
     unset NLH_PLATFORM
-    PATH='/usr/bin:/bin' echo 'no platform' | '$NLH_PASTE_SCRIPT'
+    export PATH='$empty_bin:/bin'
+    printf '%s' 'no platform' | '$NLH_PASTE_SCRIPT'
+    # capture paste exit code explicitly since pipefail is not set in this subshell
+    exit \${PIPESTATUS[1]}
   "
-  # When no clipboard tool found, should fail
-  [ "$status" -ne 0 ] || true  # may pass gracefully; just no crash
 }
