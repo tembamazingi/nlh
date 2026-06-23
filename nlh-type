@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# nlh-type — platform-agnostic synthetic paste wrapper
+# Fires a Cmd+V (macOS) or equivalent keyboard event to paste clipboard content
+# into the focused application.
+# Platform detection: same logic as nlh-paste.
+
+set -euo pipefail
+
+# shellcheck disable=SC2034
+NLH_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+detect_platform() {
+  if [[ -n "${NLH_PLATFORM:-}" ]]; then
+    echo "$NLH_PLATFORM"
+    return
+  fi
+  if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+    echo "wayland"
+    return
+  fi
+  if [[ -n "${DISPLAY:-}" ]]; then
+    echo "x11"
+    return
+  fi
+  if command -v osascript &>/dev/null; then
+    echo "macos"
+    return
+  fi
+  if command -v ydotool &>/dev/null; then
+    echo "wayland"
+    return
+  fi
+  if command -v xdotool &>/dev/null; then
+    echo "x11"
+    return
+  fi
+  echo "unknown"
+}
+
+platform=$(detect_platform)
+
+case "$platform" in
+  macos)
+    osascript -e 'tell application "System Events" to keystroke "v" using command down'
+    ;;
+  x11)
+    xdotool key --clearmodifiers ctrl+v
+    ;;
+  wayland)
+    ydotool key 29:1 47:1 47:0 29:0
+    ;;
+  *)
+    echo "nlh-type: cannot determine platform. Set NLH_PLATFORM=macos|x11|wayland or ensure osascript/xdotool/ydotool is in PATH." >&2
+    exit 1
+    ;;
+esac

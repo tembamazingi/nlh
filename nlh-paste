@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# nlh-paste — platform-agnostic clipboard write wrapper
+# Reads from stdin and writes to clipboard using the correct tool for the platform.
+# Platform detection order:
+#   1. NLH_PLATFORM env var (macos, x11, wayland)
+#   2. WAYLAND_DISPLAY env var → wayland
+#   3. DISPLAY env var → x11
+#   4. presence of pbcopy in PATH → macos
+#   5. presence of wl-copy in PATH → wayland
+#   6. presence of xclip in PATH → x11
+#   7. error
+
+set -euo pipefail
+
+detect_platform() {
+  if [[ -n "${NLH_PLATFORM:-}" ]]; then
+    echo "$NLH_PLATFORM"
+    return
+  fi
+  if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+    echo "wayland"
+    return
+  fi
+  if [[ -n "${DISPLAY:-}" ]]; then
+    echo "x11"
+    return
+  fi
+  if command -v pbcopy &>/dev/null; then
+    echo "macos"
+    return
+  fi
+  if command -v wl-copy &>/dev/null; then
+    echo "wayland"
+    return
+  fi
+  if command -v xclip &>/dev/null; then
+    echo "x11"
+    return
+  fi
+  echo "unknown"
+}
+
+platform=$(detect_platform)
+
+case "$platform" in
+  macos)
+    pbcopy
+    ;;
+  x11)
+    xclip -selection clipboard
+    ;;
+  wayland)
+    wl-copy
+    ;;
+  *)
+    echo "nlh-paste: cannot determine platform. Set NLH_PLATFORM=macos|x11|wayland or ensure pbcopy/xclip/wl-copy is in PATH." >&2
+    exit 1
+    ;;
+esac

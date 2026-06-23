@@ -1,0 +1,502 @@
+#!/usr/bin/env bash
+# nlh — Now Listen Here: local push-to-talk dictation CLI
+# Usage: nlh <subcommand> [args]
+#
+# Subcommands:
+#   setup   — interactive first-run wizard
+#   start   — register hotkey daemon and begin monitoring
+#   stop    — stop capture and run transcription/refinement/paste pipeline
+#   status  — show daemon state, model paths, last 5 captures
+#   log     — show capture history (nlh log [-a|--all])
+#   open    — open a capture in EDITOR (nlh open [<n>] [-b|--browser <n>])
+#   clear   — delete old captures interactively
+#   config  — open config file in EDITOR
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+NLH_HOME="${NLH_HOME:-$HOME/.nlh}"
+NLH_CONFIG="${NLH_CONFIG:-$NLH_HOME/config}"
+NLH_LOG="${NLH_LOG:-$NLH_HOME/captures.log}"
+NLH_ERROR_LOG="${NLH_ERROR_LOG:-$NLH_HOME/error.log}"
+
+# ── Usage ────────────────────────────────────────────────────────────────────
+
+nlh_usage() {
+  cat <<'USAGE'
+Usage: nlh <subcommand> [args]
+
+Subcommands:
+  setup              Interactive first-run wizard
+  start              Register hotkey daemon and start monitoring
+  stop               Stop audio capture and run pipeline
+  status             Show daemon state, model paths, last 5 captures
+  log [-a|--all]     Show capture history (25 most recent, or all)
+  open [<n>]         Open capture #n in EDITOR (or fzf picker if no n)
+  open -b <n>        Render capture #n as HTML and open in browser
+  clear              Interactively delete old captures
+  config             Open config file in EDITOR
+
+USAGE
+}
+
+# ── Setup ────────────────────────────────────────────────────────────────────
+
+nlh_setup() {
+  local noninteractive="${NLH_NONINTERACTIVE:-0}"
+
+  # Check for existing config
+  if [[ -f "$NLH_CONFIG" ]]; then
+    echo "nlh: config already exists at $NLH_CONFIG"
+    echo ""
+    if [[ "$noninteractive" == "1" ]]; then
+      # Non-interactive: don't overwrite
+      return 0
+    fi
+    read -r -p "Overwrite existing config? (y/N): " answer
+    case "$answer" in
+      y|Y) ;;
+      *)
+        echo "Aborted. Existing config preserved."
+        return 0
+        ;;
+    esac
+  fi
+
+  mkdir -p "$NLH_HOME/captures"
+
+  if [[ "$noninteractive" == "1" ]]; then
+    # Write defaults
+    cat > "$NLH_CONFIG" <<EOF
+whisper_model_path=
+hotkey=rcmd + ralt
+llm_backend=ollama
+llm_model_path=llama3
+llm_script_path=$SCRIPT_DIR/scripts/llm_refine.py
+llm_system_prompt=You are a transcript cleaner. Remove filler words (um, uh, like, you know), false starts, and self-corrections. Fix punctuation and capitalisation. Preserve all technical terms, proper nouns, and code identifiers exactly as spoken. Output only the cleaned transcript — no commentary, no explanations.
+log_path=$NLH_HOME/captures.log
+max_duration=300
+EOF
+    echo "nlh: default config written to $NLH_CONFIG"
+    return 0
+  fi
+
+  # Interactive wizard
+  echo "=== nlh setup ==="
+  echo ""
+
+  # Detect platform
+  local platform="unknown"
+  if [[ "$(uname)" == "Darwin" ]]; then
+    platform="macos"
+    echo "Detected platform: macOS"
+    echo "Note: Grant Accessibility permission to skhd in:"
+    echo "  System Settings > Privacy & Security > Accessibility"
+  else
+    if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+      platform="wayland"
+      echo "Detected platform: Linux (Wayland)"
+    elif [[ -n "${DISPLAY:-}" ]]; then
+      platform="x11"
+      echo "Detected platform: Linux (X11)"
+    fi
+  fi
+  echo ""
+
+  read -r -p "Whisper model path [required]: " _whisper_path
+  read -r -p "LLM backend (ollama/llama.cpp/transformers) [ollama]: " _llm_backend
+  _llm_backend="${_llm_backend:-ollama}"
+  read -r -p "LLM model path/identifier [llama3]: " _llm_model
+  _llm_model="${_llm_model:-llama3}"
+  read -r -p "Hotkey [rcmd + ralt]: " _hotkey
+  _hotkey="${_hotkey:-rcmd + ralt}"
+  read -r -p "Max recording duration in seconds [300]: " _max_dur
+  _max_dur="${_max_dur:-300}"
+
+  cat > "$NLH_CONFIG" <<EOF
+whisper_model_path=$_whisper_path
+hotkey=$_hotkey
+llm_backend=$_llm_backend
+llm_model_path=$_llm_model
+llm_script_path=$SCRIPT_DIR/scripts/llm_refine.py
+llm_system_prompt=You are a transcript cleaner. Remove filler words (um, uh, like, you know), false starts, and self-corrections. Fix punctuation and capitalisation. Preserve all technical terms, proper nouns, and code identifiers exactly as spoken. Output only the cleaned transcript — no commentary, no explanations.
+log_path=$NLH_HOME/captures.log
+max_duration=$_max_dur
+EOF
+
+  echo ""
+  echo "Config written to $NLH_CONFIG"
+
+  # Write skhd config on macOS
+  if [[ "$platform" == "macos" ]]; then
+    local skhdrc="$HOME/.skhdrc"
+    cat >> "$skhdrc" <<EOF
+
+# nlh push-to-talk
+ralt + rcmd - c : $SCRIPT_DIR/start.sh
+ralt + rcmd - c [.] : $SCRIPT_DIR/stop.sh
+EOF
+    echo "skhd config appended to $skhdrc"
+  fi
+}
+
+# ── Start ────────────────────────────────────────────────────────────────────
+
+nlh_start() {
+  local no_daemon="${NLH_NO_DAEMON:-0}"
+
+  # Load config
+  if [[ -f "$NLH_CONFIG" ]]; then
+    # shellcheck source=/dev/null
+    source "$NLH_CONFIG" 2>/dev/null || true
+  fi
+
+  # Validate model path
+  if [[ -n "${whisper_model_path:-}" ]] && [[ ! -f "${whisper_model_path}" ]]; then
+    echo "nlh: whisper model not found: $whisper_model_path" >&2
+    exit 1
+  fi
+
+  if [[ "$no_daemon" == "1" ]]; then
+    echo "nlh: daemon registration skipped (NLH_NO_DAEMON=1)"
+    return 0
+  fi
+
+  # Register daemon
+  if [[ "$(uname)" == "Darwin" ]]; then
+    if command -v skhd &>/dev/null; then
+      skhd --start-service 2>/dev/null || true
+      echo "nlh: skhd started"
+    else
+      echo "nlh: skhd not found. Install via: brew install skhd" >&2
+    fi
+    # Start ollama if configured
+    if [[ "${llm_backend:-}" == "ollama" ]] && command -v ollama &>/dev/null; then
+      ollama serve &>/dev/null &
+    fi
+  else
+    if command -v sxhkd &>/dev/null; then
+      sxhkd &>/dev/null &
+      echo "nlh: sxhkd started"
+    elif command -v keyd &>/dev/null; then
+      keyd &>/dev/null &
+      echo "nlh: keyd started"
+    fi
+  fi
+}
+
+# ── Stop (daemon stop, then run pipeline) ────────────────────────────────────
+
+nlh_stop() {
+  if [[ "$(uname)" == "Darwin" ]]; then
+    if command -v skhd &>/dev/null; then
+      skhd --stop-service 2>/dev/null || true
+      echo "nlh: skhd stopped"
+    fi
+    pkill -f "sox -d" 2>/dev/null || true
+  else
+    pkill -f sxhkd 2>/dev/null || true
+    pkill -f keyd 2>/dev/null || true
+    pkill -f "sox -d" 2>/dev/null || true
+  fi
+  # Run the stop pipeline if a capture file exists
+  local cap="${NLH_CAP_FILE:-${TMPDIR:-/tmp}/nlh_cap.wav}"
+  if [[ -f "$cap" ]]; then
+    NLH_HOME="$NLH_HOME" NLH_CONFIG="$NLH_CONFIG" \
+      NLH_LOG="$NLH_LOG" NLH_ERROR_LOG="$NLH_ERROR_LOG" \
+      NLH_CAP_FILE="$cap" \
+      "$SCRIPT_DIR/stop.sh"
+  fi
+}
+
+# ── Status ───────────────────────────────────────────────────────────────────
+
+nlh_status() {
+  echo "=== nlh status ==="
+  echo ""
+
+  # Load config
+  local whisper_model_path="" llm_backend="" llm_model_path=""
+  if [[ -f "$NLH_CONFIG" ]]; then
+    # shellcheck source=/dev/null
+    source "$NLH_CONFIG" 2>/dev/null || true
+  fi
+
+  # Daemon state
+  local daemon_state="stopped"
+  if [[ "$(uname)" == "Darwin" ]]; then
+    if pgrep -x skhd &>/dev/null; then
+      daemon_state="running"
+    fi
+  else
+    if pgrep -x sxhkd &>/dev/null || pgrep -x keyd &>/dev/null; then
+      daemon_state="running"
+    fi
+  fi
+  echo "Hotkey daemon: $daemon_state"
+
+  echo "Whisper model: ${whisper_model_path:-<not set>}"
+  echo "LLM backend:   ${llm_backend:-<not set>}"
+  echo "LLM model:     ${llm_model_path:-<not set>}"
+  echo ""
+
+  # Ollama network warning
+  if [[ "${llm_backend:-}" == "ollama" ]]; then
+    if command -v ollama &>/dev/null; then
+      local ollama_bind
+      ollama_bind=$(ollama ps 2>/dev/null | grep -v "127.0.0.1" || true)
+      if [[ -n "$ollama_bind" ]]; then
+        echo "WARNING: ollama appears to be bound to a non-loopback interface!" >&2
+      fi
+    fi
+  fi
+
+  echo "Last 5 captures:"
+  if [[ -f "$NLH_LOG" ]]; then
+    tail -5 "$NLH_LOG" | nl -ba -nrz -w2 | head -5
+  else
+    echo "  (no captures yet)"
+  fi
+}
+
+# ── Log ──────────────────────────────────────────────────────────────────────
+
+nlh_log() {
+  local all_flag=0
+  local count=25
+
+  for arg in "$@"; do
+    case "$arg" in
+      -a|--all) all_flag=1 ;;
+    esac
+  done
+
+  if [[ ! -f "$NLH_LOG" ]]; then
+    echo "(no captures yet)"
+    return 0
+  fi
+
+  if [[ "$all_flag" -eq 1 ]]; then
+    tac "$NLH_LOG" | nl -ba -nrn -w3 -v1 | less -R
+  else
+    tac "$NLH_LOG" | head -"$count" | nl -ba -nrn -w3 -v1 | less -R
+  fi
+}
+
+# ── Open ─────────────────────────────────────────────────────────────────────
+
+nlh_open() {
+  local browser_mode=0
+  local entry_num=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -b|--browser)
+        browser_mode=1
+        shift
+        if [[ $# -gt 0 ]]; then
+          entry_num="$1"
+          shift
+        fi
+        ;;
+      *)
+        entry_num="$1"
+        shift
+        ;;
+    esac
+  done
+
+  local captures_dir="$NLH_HOME/captures"
+
+  # Build sorted list (newest first) — bash 3.2 compatible
+  local capture_files=()
+  if [[ -d "$captures_dir" ]]; then
+    while IFS= read -r _f; do
+      capture_files+=("$_f")
+    done < <(find "$captures_dir" -maxdepth 1 -name '*.md' -print0 \
+               | xargs -0 ls -t 2>/dev/null || true)
+  fi
+
+  if [[ -z "$entry_num" ]]; then
+    # No entry number: try fzf, or error
+    if command -v fzf &>/dev/null; then
+      local selected
+      selected=$(printf '%s\n' "${capture_files[@]}" | fzf --preview 'cat {}' 2>/dev/null || true)
+      if [[ -n "$selected" ]]; then
+        "${EDITOR:-vi}" "$selected"
+      fi
+    else
+      echo "nlh open: Provide an entry number (nlh open <n>) or install fzf." >&2
+      exit 1
+    fi
+    return
+  fi
+
+  # Validate entry number
+  if ! [[ "$entry_num" =~ ^[0-9]+$ ]]; then
+    echo "nlh open: invalid entry number: $entry_num" >&2
+    exit 1
+  fi
+
+  local idx=$(( entry_num - 1 ))
+  if [[ $idx -lt 0 ]] || [[ $idx -ge ${#capture_files[@]} ]]; then
+    echo "nlh open: No entry #$entry_num (only ${#capture_files[@]} captures exist)" >&2
+    exit 1
+  fi
+
+  local target="${capture_files[$idx]}"
+
+  if [[ "$browser_mode" -eq 1 ]]; then
+    if ! command -v pandoc &>/dev/null; then
+      echo "nlh open: pandoc not found. Install pandoc to use browser mode." >&2
+      exit 1
+    fi
+    local html_file="${TMPDIR:-/tmp}/nlh_open_$$.html"
+    pandoc -f markdown -t html -o "$html_file" "$target"
+    if [[ "$(uname)" == "Darwin" ]]; then
+      open "$html_file"
+    else
+      xdg-open "$html_file" 2>/dev/null || open "$html_file" 2>/dev/null || true
+    fi
+  else
+    "${EDITOR:-vi}" "$target"
+  fi
+}
+
+# ── Clear ────────────────────────────────────────────────────────────────────
+
+nlh_clear() {
+  local captures_dir="$NLH_HOME/captures"
+
+  echo "Clear captures older than:"
+  echo "  1) 1 day"
+  echo "  2) 7 days"
+  echo "  3) 2 weeks"
+  echo "  4) All"
+  read -r -p "> " choice
+
+  local cutoff_date=""
+  local label=""
+
+  case "$choice" in
+    1)
+      cutoff_date=$(date -d "1 day ago" '+%Y-%m-%d' 2>/dev/null || date -v-1d '+%Y-%m-%d')
+      label="1 day"
+      ;;
+    2)
+      cutoff_date=$(date -d "7 days ago" '+%Y-%m-%d' 2>/dev/null || date -v-7d '+%Y-%m-%d')
+      label="7 days"
+      ;;
+    3)
+      cutoff_date=$(date -d "14 days ago" '+%Y-%m-%d' 2>/dev/null || date -v-14d '+%Y-%m-%d')
+      label="2 weeks"
+      ;;
+    4)
+      label="all"
+      ;;
+    *)
+      echo "Cancelled."
+      return 0
+      ;;
+  esac
+
+  # Find matching .md files
+  local to_delete=()
+  for f in "$captures_dir/"*.md; do
+    [[ -f "$f" ]] || continue
+    local fname
+    fname=$(basename "$f" .md)
+    # filename is YYYY-MM-DDTHH-MM-SS; extract date portion
+    local fdate="${fname:0:10}"
+    if [[ "$label" == "all" ]]; then
+      to_delete+=("$f")
+    elif [[ "$fdate" < "$cutoff_date" ]]; then
+      to_delete+=("$f")
+    fi
+  done
+
+  local count=${#to_delete[@]}
+  if [[ $count -eq 0 ]]; then
+    echo "No captures found to remove."
+    return 0
+  fi
+
+  echo ""
+  echo "This will remove $count capture(s) older than $label."
+  read -r -p "Confirm? (y/N): " confirm
+
+  case "$confirm" in
+    y|Y) ;;
+    *)
+      echo "Cancelled."
+      return 0
+      ;;
+  esac
+
+  # Remove .md files and corresponding log entries
+  if [[ "$label" == "all" ]]; then
+    # Clear everything: remove all md files and truncate the log
+    for f in "${to_delete[@]}"; do
+      rm -f "$f"
+    done
+    if [[ -f "$NLH_LOG" ]]; then
+      true > "$NLH_LOG"
+    fi
+  else
+    for f in "${to_delete[@]}"; do
+      rm -f "$f"
+      local fname
+      fname=$(basename "$f" .md)
+      # Convert YYYY-MM-DDTHH-MM-SS to [HH:MM:SS] for log matching
+      local hh="${fname:11:2}"
+      local mm="${fname:14:2}"
+      local ss="${fname:17:2}"
+      local log_time="[$hh:$mm:$ss]"
+      if [[ -f "$NLH_LOG" ]]; then
+        local tmp_log
+        tmp_log=$(mktemp)
+        # Use grep -F for fixed-string match to avoid bracket interpretation
+        grep -Fv "$log_time" "$NLH_LOG" > "$tmp_log" || true
+        mv "$tmp_log" "$NLH_LOG"
+      fi
+    done
+  fi
+
+  echo "Removed $count capture(s)."
+}
+
+# ── Config ───────────────────────────────────────────────────────────────────
+
+nlh_config() {
+  if [[ ! -f "$NLH_CONFIG" ]]; then
+    echo "nlh: no config found. Run 'nlh setup' first." >&2
+    exit 1
+  fi
+  "${EDITOR:-vi}" "$NLH_CONFIG"
+}
+
+# ── Dispatch ─────────────────────────────────────────────────────────────────
+
+cmd="${1:-}"
+
+case "$cmd" in
+  ""|-h|--help)
+    nlh_usage
+    [[ "$cmd" == "-h" || "$cmd" == "--help" ]] && exit 0 || exit 1
+    ;;
+  setup)   shift; nlh_setup  "$@" ;;
+  start)   shift; nlh_start  "$@" ;;
+  stop)    shift; nlh_stop   "$@" ;;
+  status)  shift; nlh_status "$@" ;;
+  log)     shift; nlh_log    "$@" ;;
+  open)    shift; nlh_open   "$@" ;;
+  clear)   shift; nlh_clear  "$@" ;;
+  config)  shift; nlh_config "$@" ;;
+  *)
+    echo "nlh: Unknown command: '$cmd'" >&2
+    echo "" >&2
+    nlh_usage >&2
+    exit 1
+    ;;
+esac
